@@ -119,56 +119,72 @@ DEVJOBS_WIEN_ID = "109166"
 # ---------------------------------------------------------------------------
 
 GEMINI_BATCH_PROMPT = """\
-You are a strict job-filter assistant for the Austrian IT job market.
-You will receive a JSON array of job listings. Evaluate EACH one and return
-the IDs of the jobs that are genuine IT / Software QA roles.
+You are a LENIENT job-filter assistant for the Austrian IT job market.
+Your job is to KEEP most jobs and only remove those that are 100% unrelated
+to IT / Software / Technology quality assurance.
 
-=== ALLOW (IT / Software QA) ===
-Titles: Software Tester, Softwaretester, QA Engineer, QA Analyst,
-  Quality Assurance Engineer, Test Automation Engineer, SDET, Testanalyst,
-  Testingenieur (Software/IT), Agile Tester, Scrum Tester, Performance Tester,
-  Security Tester (software), Test Manager, Testmanager, QA Lead,
-  QA/QC Engineer (software dev), Quality Engineer (Software),
-  Manual Tester, Functional Tester, Integration Tester (software context)
+GOLDEN RULE: When in doubt, KEEP the job (approve it).
+Prefer false positives over false negatives.
 
-Strong ALLOW signals in description:
-  Selenium, Cypress, Playwright, Appium, WebdriverIO,
-  JUnit, TestNG, NUnit, PyTest, Robot Framework,
-  JIRA, TestRail, Xray, Zephyr, qTest,
-  CI/CD, Jenkins, GitLab CI, GitHub Actions,
-  API testing, REST testing, Postman, SoapUI,
-  Python, Java, TypeScript, JavaScript (testing context),
-  test cases, test plans, test strategy, bug reports,
-  regression testing, smoke testing, exploratory testing
+=== ALWAYS KEEP — approve any job that matches ANY of these ===
 
-=== BLOCK (Manufacturing / Non-IT QA) ===
-Industry context alone is enough to BLOCK:
-  Physical manufacturing, factory, heavy industry, construction,
-  civil/mechanical engineering, pharma production, food & beverage,
-  medical devices (UNLESS explicitly software/CSV/GAMP validation)
+Titles (approve on title alone, no further checks needed):
+  Software Tester, Softwaretester, QA Engineer, QA Analyst,
+  Quality Assurance Engineer, Test Automation Engineer, QA Automation Engineer,
+  SDET, Testanalyst, Testingenieur, System Test Engineer, Verification Engineer,
+  Agile Tester, Performance Tester, Security Tester, Test Manager, Testmanager,
+  QA Lead, QA Director, Head of QA, Head of Quality Engineering,
+  QA/QC Engineer (software or IT context), Quality Engineer (Software),
+  Manual Tester, Functional Tester, Integration Tester,
+  Test Architect, Test Consultant, Test Coordinator
 
-German BLOCK words — any single match = BLOCK:
-  Produktion, Produktionslinie, Fertigung, Fertigungsanlage,
-  Fließband, Schichtarbeit, Schichtdienst,
-  Bau, Bauingenieur, Baustelle,
-  Wareneingangsprüfung, Endprüfung, Endkontrolle,
-  Reklamationsbearbeitung, ISO 13485, ISO 14001, GMP, HACCP,
-  Laborant, Lebensmittelkontrolle, Qualitätssicherung in der Produktion
+Approve any role whose title explicitly contains any of these words/fragments
+(case-insensitive): tester, testing, testautomation, test automation,
+  testmanager, testmanagement, testanalyst, testingenieur, qa engineer,
+  quality assurance, softwaretest, software test, agile test
 
-English BLOCK words:
-  production line, factory, manufacturing plant, construction site,
-  civil engineering QA/QC, pharmaceutical manufacturing QA,
-  incoming goods inspection, shift work (manufacturing)
+Ambiguous or borderline titles — ALWAYS KEEP:
+  "Junior UI/UX Design & App-Testing/QA", embedded system test roles,
+  hardware-in-the-loop (HIL) test roles, automotive software testing,
+  any role that combines another discipline WITH explicit testing/QA mention
+
+=== ONLY REMOVE — drop a job ONLY if it clearly matches one of these buckets ===
+Remove ONLY when the title AND description together make it unambiguous.
+A vague title is never enough to remove a job on its own.
+
+1. Civil / Construction / Energy infrastructure QA:
+   Bauingenieur, Owner Engineer, Bauprojekt, Windenergie, Photovoltaik,
+   Quantity Surveyor, Real Estate quality, site inspection (physical)
+
+2. Medical / Pharmaceutical / Chemical / Food QA:
+   Sterility Assurance, GMP Auditor, klinisches Qualitätsmanagement,
+   QC Method Compliance (lab), Laboratory QA/QC, food safety, HACCP,
+   Lebensmittelkontrolle, Laborant
+
+3. Pure industrial / manufacturing inspection (no software involved):
+   Qualitätsprüfer on a production line, Mess- und Prüfraum (metrology),
+   Wareneingangsprüfung, Endprüfung (physical goods),
+   Fließband, Schichtarbeit in Fertigung, Schweißnaht inspection
+
+4. General business / marketplace quality management (no IT QA):
+   Marketplace Seller Quality Manager, Customer Service Quality,
+   Call-centre quality monitoring
+
+5. Pure software DEVELOPMENT roles with ZERO testing mention:
+   Only remove if the title is purely a developer role (e.g. ".NET Developer",
+   "Web Architect", "DevOps Engineer", "Team Lead Web Development") AND the
+   description contains absolutely no reference to testing, QA, or quality.
+   If the description mentions testing even once, KEEP it.
 
 === INPUT JOBS ===
 {jobs_json}
 
 === OUTPUT RULES (CRITICAL) ===
-- Return ONLY a raw JSON integer array containing the "id" values of matching jobs.
-- Example: [0, 3, 7]
-- If no jobs match, return: []
+- Return ONLY a raw JSON integer array of the "id" values of jobs to KEEP.
+- Example: [0, 1, 3, 5, 7]
+- If no jobs qualify, return: []
 - Output ONLY the JSON array. No explanation, no markdown fences, no backticks,
-  no code blocks, no text before or after the JSON array. Nothing else.\
+  no code blocks, no text before or after the array. Nothing else.\
 """
 
 # ---------------------------------------------------------------------------
