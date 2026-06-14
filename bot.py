@@ -460,32 +460,42 @@ def scrape_devjobs_at() -> list[Job]:
 # ---------------------------------------------------------------------------
 
 
-def _extract_json_array(text: str) -> list[int] | None:
+def _extract_json_array(text: str) -> list[int]:
     """
-    Robustly extract a JSON integer array from a Gemini response.
-    Handles:
-      - Plain arrays:          [0, 3, 7]
-      - Markdown code fences:  ```json\n[0, 3]\n```  or  ```[0, 3]```
-      - Extra surrounding text: "Sure! Here are the IDs: [2, 5]"
-    Returns None if no valid array is found.
-    """
-    # Strip markdown code fences first (```json ... ``` or ``` ... ```)
-    text = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    Extract integer IDs from a Gemini response using a two-stage approach:
 
-    # Find the outermost [...] block
-    match = re.search(r"(\[.*?\])", text, re.DOTALL)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(1))
-        if isinstance(parsed, list) and all(isinstance(x, int) for x in parsed):
-            return parsed
-        # Handle list-of-strings like ["0", "3"] — Gemini occasionally does this
-        if isinstance(parsed, list):
-            return [int(x) for x in parsed]
-    except (json.JSONDecodeError, ValueError):
-        pass
-    return None
+    Stage 1 — strict JSON parse:
+      Strip markdown fences, find the outermost [...] block, parse it.
+      Handles: plain arrays, fenced code blocks, surrounding prose.
+
+    Stage 2 — re.findall digit extraction (fallback for truncated responses):
+      If strict parsing fails (e.g. Gemini returned "[0, 1," — a cut-off array),
+      extract every decimal number from the whole response text.
+      This is intentionally permissive: a truncated "[0, 1," becomes [0, 1].
+
+    Always returns a list (possibly empty) — never raises, never returns None.
+    """
+    # ── Stage 1: strict JSON parse ───────────────────────────────────────────
+    cleaned = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    match = re.search(r"(\[.*?\])", cleaned, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, list):
+                return [int(x) for x in parsed]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    # ── Stage 2: digit fallback — handles truncated / malformed responses ────
+    digits = re.findall(r"\d+", text)
+    if digits:
+        logger.debug(
+            "_extract_json_array: JSON parse failed; using digit fallback on %r",
+            text[:200],
+        )
+        return [int(d) for d in digits]
+
+    return []
 
 
 def filter_jobs_batch(jobs: list[Job], client: genai.Client) -> set[int]:
@@ -515,19 +525,24 @@ def filter_jobs_batch(jobs: list[Job], client: genai.Client) -> set[int]:
             config=types.GenerateContentConfig(
                 max_output_tokens=200,
                 temperature=0.0,
+                # Disable automatic function calling so the SDK executes a single
+                # sequential HTTP request and honours our inter-batch sleep.
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True,
+                ),
             ),
         )
         raw = response.text.strip()
         logger.debug("Gemini raw response: %r", raw[:300])
 
         ids = _extract_json_array(raw)
-        if ids is None:
+        if not ids and raw not in ("", "[]"):
+            # An empty result on a non-empty, non-empty-array response is
+            # suspicious — log it so we can debug future edge cases.
             logger.warning(
-                "Gemini batch: could not parse JSON array from response %r "
-                "— dropping batch (0 approved).",
+                "Gemini batch: no IDs extracted from response %r — dropping batch.",
                 raw[:200],
             )
-            return set()
 
         valid_ids = {i for i in ids if isinstance(i, int) and 0 <= i < len(jobs)}
         logger.info(
