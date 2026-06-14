@@ -59,8 +59,8 @@ TELEGRAM_DELAY_SEC = 1
 REQUEST_TIMEOUT_SEC = 30
 # Batch processing: group new jobs before calling Gemini.
 # Free tier = 15 RPM; one batch call per ~15 jobs is far cheaper than per-job.
-GEMINI_BATCH_SIZE = 15        # jobs per Gemini call
-GEMINI_BATCH_DELAY = 2        # seconds to sleep between consecutive batch calls
+GEMINI_BATCH_SIZE = 10        # jobs per Gemini call (smaller = safer for free tier)
+GEMINI_BATCH_DELAY = 12       # seconds between batches (~5 batches/min < 15 RPM limit)
 
 HEADERS = {
     "User-Agent": (
@@ -168,7 +168,8 @@ English BLOCK words:
 - Return ONLY a raw JSON integer array containing the "id" values of matching jobs.
 - Example: [0, 3, 7]
 - If no jobs match, return: []
-- Output ONLY the JSON array. No explanation, no markdown fences, no extra text.\
+- Output ONLY the JSON array. No explanation, no markdown fences, no backticks,
+  no code blocks, no text before or after the JSON array. Nothing else.\
 """
 
 # ---------------------------------------------------------------------------
@@ -459,12 +460,41 @@ def scrape_devjobs_at() -> list[Job]:
 # ---------------------------------------------------------------------------
 
 
+def _extract_json_array(text: str) -> list[int] | None:
+    """
+    Robustly extract a JSON integer array from a Gemini response.
+    Handles:
+      - Plain arrays:          [0, 3, 7]
+      - Markdown code fences:  ```json\n[0, 3]\n```  or  ```[0, 3]```
+      - Extra surrounding text: "Sure! Here are the IDs: [2, 5]"
+    Returns None if no valid array is found.
+    """
+    # Strip markdown code fences first (```json ... ``` or ``` ... ```)
+    text = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+
+    # Find the outermost [...] block
+    match = re.search(r"(\[.*?\])", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(1))
+        if isinstance(parsed, list) and all(isinstance(x, int) for x in parsed):
+            return parsed
+        # Handle list-of-strings like ["0", "3"] — Gemini occasionally does this
+        if isinstance(parsed, list):
+            return [int(x) for x in parsed]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
 def filter_jobs_batch(jobs: list[Job], client: genai.Client) -> set[int]:
     """
-    Send a batch of jobs to Gemini in a single call.
-    Returns the set of list-indices (0-based) whose jobs are IT/Software QA roles.
-    Fails open — returns all indices — on any API or parse error, so real jobs
-    are never silently dropped.
+    Send a batch of jobs to Gemini in one call.
+    Returns the set of 0-based indices whose jobs are IT/Software QA roles.
+
+    FAIL-CLOSED: on any API error (including 429) or parse failure, returns an
+    empty set so no unvetted jobs are forwarded to Telegram.
     """
     job_data = [
         {
@@ -488,21 +518,31 @@ def filter_jobs_batch(jobs: list[Job], client: genai.Client) -> set[int]:
             ),
         )
         raw = response.text.strip()
-        # Accept either a bare array or one wrapped in markdown fences
-        match = re.search(r"\[[\d\s,]*\]", raw, re.DOTALL)
-        if not match:
-            logger.warning("Gemini batch: unexpected response %r — passing all through.", raw[:200])
-            return set(range(len(jobs)))
-        ids: list[int] = json.loads(match.group())
+        logger.debug("Gemini raw response: %r", raw[:300])
+
+        ids = _extract_json_array(raw)
+        if ids is None:
+            logger.warning(
+                "Gemini batch: could not parse JSON array from response %r "
+                "— dropping batch (0 approved).",
+                raw[:200],
+            )
+            return set()
+
         valid_ids = {i for i in ids if isinstance(i, int) and 0 <= i < len(jobs)}
         logger.info(
             "Gemini batch (%d jobs) → %d matched: IDs %s",
             len(jobs), len(valid_ids), sorted(valid_ids),
         )
         return valid_ids
+
     except Exception as exc:  # noqa: BLE001
-        logger.error("Gemini batch API error: %s — passing all %d jobs through.", exc, len(jobs))
-        return set(range(len(jobs)))  # fail open
+        logger.error(
+            "Gemini batch error: %s — dropping batch (0 approved). "
+            "Will sleep %ss before next batch.",
+            exc, GEMINI_BATCH_DELAY,
+        )
+        return set()  # fail closed — never spam Telegram with unvetted jobs
 
 
 # ---------------------------------------------------------------------------
@@ -622,9 +662,10 @@ def main() -> None:
                 skipped_filter += 1
                 logger.info("Non-IT QA — filtered: %s", job.title)
 
-        # Sleep between batches (not after the last one)
+        # Always sleep between batches — even after an error/429 — so the next
+        # batch doesn't immediately hit the same rate-limit wall.
         if batch_start + GEMINI_BATCH_SIZE < len(new_jobs):
-            logger.debug("Sleeping %ss before next Gemini batch...", GEMINI_BATCH_DELAY)
+            logger.info("Sleeping %ss before next Gemini batch...", GEMINI_BATCH_DELAY)
             time.sleep(GEMINI_BATCH_DELAY)
 
     logger.info(
