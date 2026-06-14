@@ -51,7 +51,7 @@ TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
 
 DB_FILE = "jobs_db.json"
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-1.5-flash-latest"
 
 # Polite scraping delays (be a good citizen)
 SCRAPE_DELAY_SEC = 2
@@ -59,7 +59,7 @@ TELEGRAM_DELAY_SEC = 1
 REQUEST_TIMEOUT_SEC = 30
 # Gemini: single call for all new jobs.
 # If a 429 is hit, retry once after a longer wait.
-GEMINI_RETRY_WAIT = 45        # seconds to wait after a 429 before the single retry
+GEMINI_RETRY_WAIT = 90        # seconds to wait after a 429 before the single retry
 
 HEADERS = {
     "User-Agent": (
@@ -120,68 +120,80 @@ DEVJOBS_WIEN_ID = "109166"
 
 GEMINI_BATCH_PROMPT = """\
 You are a LENIENT job-filter assistant for the Austrian IT job market.
-Your job is to KEEP most jobs and only remove those that are 100% unrelated
-to IT / Software / Technology quality assurance.
 
-GOLDEN RULE: When in doubt, KEEP the job (approve it).
-Prefer false positives over false negatives.
+Your PRIMARY DIRECTIVE: approve every job that has ANY connection to
+IT / software / technology quality assurance or testing.
 
-=== ALWAYS KEEP — approve any job that matches ANY of these ===
+GOLDEN RULE — ALWAYS APPROVE WHEN IN DOUBT.
+If you are not 100% certain a job belongs to the REMOVE list below,
+you MUST approve it. False positives are acceptable. False negatives are not.
 
-Titles (approve on title alone, no further checks needed):
-  Software Tester, Softwaretester, QA Engineer, QA Analyst,
-  Quality Assurance Engineer, Test Automation Engineer, QA Automation Engineer,
-  SDET, Testanalyst, Testingenieur, System Test Engineer, Verification Engineer,
-  Agile Tester, Performance Tester, Security Tester, Test Manager, Testmanager,
-  QA Lead, QA Director, Head of QA, Head of Quality Engineering,
-  QA/QC Engineer (software or IT context), Quality Engineer (Software),
-  Manual Tester, Functional Tester, Integration Tester,
-  Test Architect, Test Consultant, Test Coordinator
+════════════════════════════════════════════════════════
+STEP 1 — AUTO-APPROVE (no further evaluation needed)
+════════════════════════════════════════════════════════
+If the job TITLE contains ANY of these fragments (case-insensitive),
+approve immediately without reading the description:
 
-Approve any role whose title explicitly contains any of these words/fragments
-(case-insensitive): tester, testing, testautomation, test automation,
-  testmanager, testmanagement, testanalyst, testingenieur, qa engineer,
-  quality assurance, softwaretest, software test, agile test
+  tester, testing, test automation, testautomation,
+  test engineer, testingenieur, testengineer,
+  testmanager, testmanagement, testanalyst, testanalyst,
+  qa engineer, qa analyst, qa lead, qa director, qa automation,
+  quality assurance engineer, quality assurance analyst,
+  softwaretest, software test, software tester, softwaretester,
+  verification engineer, system test, agile tester,
+  performance tester, security tester, test architect,
+  head of qa, head of quality, head of testing
 
-Ambiguous or borderline titles — ALWAYS KEEP:
-  "Junior UI/UX Design & App-Testing/QA", embedded system test roles,
-  hardware-in-the-loop (HIL) test roles, automotive software testing,
-  any role that combines another discipline WITH explicit testing/QA mention
+Examples that MUST be auto-approved:
+  • "Software Test Engineer (m/w/d)"
+  • "Test Automation Engineer C# (m/w/d)"
+  • "Agile Senior Software Testautomation Engineer"
+  • "Testmanager (m/w/d)"
+  • "Senior QA Automation Engineer"
+  • "Junior UI/UX Design & App-Testing/QA"
+  • "Technical QA Lead"
+  • "Head of Quality Engineering & Automation"
+  • "Director Software Quality & Automation"
 
-=== ONLY REMOVE — drop a job ONLY if it clearly matches one of these buckets ===
-Remove ONLY when the title AND description together make it unambiguous.
-A vague title is never enough to remove a job on its own.
+════════════════════════════════════════════════════════
+STEP 2 — REMOVE only these clearly non-IT categories
+════════════════════════════════════════════════════════
+Only drop a job if BOTH the title AND description confirm it belongs
+to one of these five buckets. A vague title is never enough alone.
 
-1. Civil / Construction / Energy infrastructure QA:
+1. Civil / Construction / Energy infrastructure:
    Bauingenieur, Owner Engineer, Bauprojekt, Windenergie, Photovoltaik,
-   Quantity Surveyor, Real Estate quality, site inspection (physical)
+   Quantity Surveyor, Real Estate quality, physical site inspection.
 
-2. Medical / Pharmaceutical / Chemical / Food QA:
+2. Medical / Pharmaceutical / Clinical / Food safety:
    Sterility Assurance, GMP Auditor, klinisches Qualitätsmanagement,
-   QC Method Compliance (lab), Laboratory QA/QC, food safety, HACCP,
-   Lebensmittelkontrolle, Laborant
+   QC Method Compliance (laboratory), food safety, HACCP,
+   Lebensmittelkontrolle, Laborant (chemistry/biology lab).
 
-3. Pure industrial / manufacturing inspection (no software involved):
-   Qualitätsprüfer on a production line, Mess- und Prüfraum (metrology),
-   Wareneingangsprüfung, Endprüfung (physical goods),
-   Fließband, Schichtarbeit in Fertigung, Schweißnaht inspection
+3. Pure physical manufacturing / industrial inspection:
+   Qualitätsprüfer on a production line, Wareneingangspüfung,
+   Endprüfung (physical goods), Fließband, Schichtarbeit in Fertigung.
 
-4. General business / marketplace quality management (no IT QA):
+4. General business / marketplace quality:
    Marketplace Seller Quality Manager, Customer Service Quality,
-   Call-centre quality monitoring
+   call-centre quality monitoring (no IT/software involvement).
 
-5. Pure software DEVELOPMENT roles with ZERO testing mention:
-   Only remove if the title is purely a developer role (e.g. ".NET Developer",
-   "Web Architect", "DevOps Engineer", "Team Lead Web Development") AND the
-   description contains absolutely no reference to testing, QA, or quality.
-   If the description mentions testing even once, KEEP it.
+5. Pure software DEVELOPMENT with ZERO testing mention:
+   Remove only if the title is a pure developer/DevOps/infra role
+   (e.g. ".NET Developer", "DevOps Engineer", "Team Lead Web Development")
+   AND the description contains no mention of testing, QA, or quality.
+   If the description mentions testing even once — KEEP IT.
 
-=== INPUT JOBS ===
+════════════════════════════════════════════════════════
+INPUT JOBS
+════════════════════════════════════════════════════════
 {jobs_json}
 
-=== OUTPUT RULES (CRITICAL) ===
+════════════════════════════════════════════════════════
+OUTPUT RULES (CRITICAL)
+════════════════════════════════════════════════════════
 - Return ONLY a raw JSON integer array of the "id" values of jobs to KEEP.
-- Example: [0, 1, 3, 5, 7]
+- Example: [0, 1, 2, 3, 5, 7]
 - If no jobs qualify, return: []
 - Output ONLY the JSON array. No explanation, no markdown fences, no backticks,
   no code blocks, no text before or after the array. Nothing else.\
