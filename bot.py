@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -56,15 +57,32 @@ GEMINI_MODEL = "gemini-2.5-flash"
 SCRAPE_DELAY_SEC = 2
 TELEGRAM_DELAY_SEC = 1
 REQUEST_TIMEOUT_SEC = 30
+# Free-tier Gemini limit: 15 RPM → one call every 4 seconds minimum.
+# We use 4.5 s for a small safety margin.
+GEMINI_RATE_LIMIT_SLEEP = 4.5
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/125.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "de-AT,de;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "DNT": "1",
+}
+
+# devjobs.at is more aggressive about bot detection — use a stricter header set
+# with a Referer that mimics organic navigation from the homepage.
+DEVJOBS_HEADERS = {
+    **HEADERS,
+    "Referer": "https://devjobs.at/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # ---------------------------------------------------------------------------
@@ -231,10 +249,14 @@ def save_seen_hashes(hashes: set[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def fetch_page(url: str) -> Optional[BeautifulSoup]:
+def fetch_page(url: str, headers: dict | None = None) -> Optional[BeautifulSoup]:
     """GET a URL and return a parsed BeautifulSoup, or None on failure."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT_SEC)
+        resp = requests.get(
+            url,
+            headers=headers if headers is not None else HEADERS,
+            timeout=REQUEST_TIMEOUT_SEC,
+        )
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
     except requests.RequestException as exc:
@@ -406,9 +428,9 @@ def scrape_devjobs_at() -> list[Job]:
 
     for url in _devjobs_urls():
         logger.info("devjobs.at → %s", url)
-        soup = fetch_page(url)
+        soup = fetch_page(url, headers=DEVJOBS_HEADERS)
         if soup is None:
-            time.sleep(SCRAPE_DELAY_SEC)
+            time.sleep(random.uniform(2, 5))
             continue
 
         for link in soup.find_all("a", href=_DEVJOBS_JOB_HREF):
@@ -441,7 +463,10 @@ def scrape_devjobs_at() -> list[Job]:
                 )
             )
 
-        time.sleep(SCRAPE_DELAY_SEC)
+        # Random delay between keyword requests to avoid 429 rate-limiting
+        delay = random.uniform(2, 5)
+        logger.debug("devjobs.at — sleeping %.1fs before next request", delay)
+        time.sleep(delay)
 
     logger.info("devjobs.at: %d jobs collected", len(jobs))
     return jobs
@@ -466,6 +491,7 @@ def is_it_qa_role(job: Job, client: genai.Client) -> bool:
         location=job.location,
         description=job.description[:1500],  # stay well within token limits
     )
+    result = True  # fail-open default
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
@@ -481,10 +507,14 @@ def is_it_qa_role(job: Job, client: genai.Client) -> bool:
             f"'{job.title[:50]}'",
             verdict,
         )
-        return verdict.startswith("YES")
+        result = verdict.startswith("YES")
     except Exception as exc:  # noqa: BLE001
         logger.error("Gemini API error for '%s': %s — passing through.", job.title, exc)
-        return True  # fail open
+        result = True  # fail open
+    finally:
+        # Enforce free-tier limit: max 15 requests/min → sleep 4.5 s after every call
+        time.sleep(GEMINI_RATE_LIMIT_SLEEP)
+    return result
 
 
 # ---------------------------------------------------------------------------
