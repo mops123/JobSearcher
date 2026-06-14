@@ -51,7 +51,7 @@ TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
 
 DB_FILE = "jobs_db.json"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-1.5-flash"
 
 # Polite scraping delays (be a good citizen)
 SCRAPE_DELAY_SEC = 2
