@@ -57,9 +57,10 @@ GEMINI_MODEL = "gemini-2.5-flash"
 SCRAPE_DELAY_SEC = 2
 TELEGRAM_DELAY_SEC = 1
 REQUEST_TIMEOUT_SEC = 30
-# Free-tier Gemini limit: 15 RPM → one call every 4 seconds minimum.
-# We use 4.5 s for a small safety margin.
-GEMINI_RATE_LIMIT_SLEEP = 4.5
+# Batch processing: group new jobs before calling Gemini.
+# Free tier = 15 RPM; one batch call per ~15 jobs is far cheaper than per-job.
+GEMINI_BATCH_SIZE = 15        # jobs per Gemini call
+GEMINI_BATCH_DELAY = 2        # seconds to sleep between consecutive batch calls
 
 HEADERS = {
     "User-Agent": (
@@ -118,75 +119,56 @@ DEVJOBS_WIEN_ID = "109166"
 # Gemini Classification Prompt  (bilingual DE/EN, temperature=0)
 # ---------------------------------------------------------------------------
 
-GEMINI_PROMPT_TEMPLATE = """\
-You are a strict job classification expert for the Austrian IT job market.
-Your ONLY task: decide whether the job below is an IT / Software QA role.
+GEMINI_BATCH_PROMPT = """\
+You are a strict job-filter assistant for the Austrian IT job market.
+You will receive a JSON array of job listings. Evaluate EACH one and return
+the IDs of the jobs that are genuine IT / Software QA roles.
 
-════════════════════════════════════════════════════════
-✅  CLASSIFY AS "YES" — IT / Software QA  (ALLOW)
-════════════════════════════════════════════════════════
-Titles (English & German):
-  Software Tester, Softwaretester, QA Engineer, QA Analyst,
-  Quality Assurance Engineer, Test Automation Engineer, SDET,
-  Testanalyst, Testingenieur (Software/IT), Agile Tester,
-  Scrum Tester, Performance Tester, Security Tester (software),
-  Test Manager, Testmanager, QA Lead, QA/QC Engineer (software dev),
-  Quality Engineer (Software), Manual Tester, Functional Tester,
-  Integration Tester (software context)
+=== ALLOW (IT / Software QA) ===
+Titles: Software Tester, Softwaretester, QA Engineer, QA Analyst,
+  Quality Assurance Engineer, Test Automation Engineer, SDET, Testanalyst,
+  Testingenieur (Software/IT), Agile Tester, Scrum Tester, Performance Tester,
+  Security Tester (software), Test Manager, Testmanager, QA Lead,
+  QA/QC Engineer (software dev), Quality Engineer (Software),
+  Manual Tester, Functional Tester, Integration Tester (software context)
 
-Strong YES signals — any of these keywords in the description:
+Strong ALLOW signals in description:
   Selenium, Cypress, Playwright, Appium, WebdriverIO,
   JUnit, TestNG, NUnit, PyTest, Robot Framework,
   JIRA, TestRail, Xray, Zephyr, qTest,
   CI/CD, Jenkins, GitLab CI, GitHub Actions,
   API testing, REST testing, Postman, SoapUI,
-  Python, Java, TypeScript, JavaScript (in a testing context),
+  Python, Java, TypeScript, JavaScript (testing context),
   test cases, test plans, test strategy, bug reports,
-  regression testing, smoke testing, exploratory testing,
-  Agile, Scrum, Kanban (in software teams)
+  regression testing, smoke testing, exploratory testing
 
-════════════════════════════════════════════════════════
-❌  CLASSIFY AS "NO" — Manufacturing / Non-IT QA  (BLOCK)
-════════════════════════════════════════════════════════
-Industry context triggers immediate NO:
-  Physical manufacturing, factory floors, heavy industry,
-  construction, civil engineering, mechanical engineering,
-  pharmaceutical production, food & beverage, medical devices
-  (UNLESS the role is explicitly about SOFTWARE validation, e.g. CSV/GAMP)
+=== BLOCK (Manufacturing / Non-IT QA) ===
+Industry context alone is enough to BLOCK:
+  Physical manufacturing, factory, heavy industry, construction,
+  civil/mechanical engineering, pharma production, food & beverage,
+  medical devices (UNLESS explicitly software/CSV/GAMP validation)
 
-German block-words — if the description contains ANY of these, answer NO:
-  Produktion, Produktionslinie, Produktionsmitarbeiter,
-  Fertigung, Fertigungsanlage, Fertigungsqualität,
+German BLOCK words — any single match = BLOCK:
+  Produktion, Produktionslinie, Fertigung, Fertigungsanlage,
   Fließband, Schichtarbeit, Schichtdienst,
-  Bau, Bauingenieur, Baustelle, Bauqualität,
-  Wareneingangsprüfung, Wareneingang,
-  Endprüfung, Endkontrolle,
-  Reklamationsbearbeitung, Reklamation (manufacturing),
-  ISO 9001 (unless software-process context),
-  ISO 13485, ISO 14001, GMP, HACCP,
-  Laborant, Laborkontrolle, Lebensmittelkontrolle,
-  Qualitätssicherung in der Produktion,
-  Qualitätsmanager Fertigung
+  Bau, Bauingenieur, Baustelle,
+  Wareneingangsprüfung, Endprüfung, Endkontrolle,
+  Reklamationsbearbeitung, ISO 13485, ISO 14001, GMP, HACCP,
+  Laborant, Lebensmittelkontrolle, Qualitätssicherung in der Produktion
 
-English block-words:
-  production line, factory, manufacturing plant,
-  construction site, civil engineering QA/QC,
-  pharmaceutical manufacturing QA,
+English BLOCK words:
+  production line, factory, manufacturing plant, construction site,
+  civil engineering QA/QC, pharmaceutical manufacturing QA,
   incoming goods inspection, shift work (manufacturing)
 
-════════════════════════════════════════════════════════
-🔍  JOB TO CLASSIFY
-════════════════════════════════════════════════════════
-Title:       {title}
-Company:     {company}
-Location:    {location}
-Description: {description}
+=== INPUT JOBS ===
+{jobs_json}
 
-════════════════════════════════════════════════════════
-📌  YOUR RESPONSE
-════════════════════════════════════════════════════════
-Reply with exactly ONE word — either YES or NO.
-Do not add any explanation, punctuation, or extra words.\
+=== OUTPUT RULES (CRITICAL) ===
+- Return ONLY a raw JSON integer array containing the "id" values of matching jobs.
+- Example: [0, 3, 7]
+- If no jobs match, return: []
+- Output ONLY the JSON array. No explanation, no markdown fences, no extra text.\
 """
 
 # ---------------------------------------------------------------------------
@@ -477,44 +459,50 @@ def scrape_devjobs_at() -> list[Job]:
 # ---------------------------------------------------------------------------
 
 
-def is_it_qa_role(job: Job, client: genai.Client) -> bool:
+def filter_jobs_batch(jobs: list[Job], client: genai.Client) -> set[int]:
     """
-    Ask Gemini whether this job is an IT/Software QA role.
-
-    Returns True  → send notification.
-    Returns False → skip (manufacturing / non-IT QA, or unrelated).
-    Fails open on transient API errors to avoid silently dropping real jobs.
+    Send a batch of jobs to Gemini in a single call.
+    Returns the set of list-indices (0-based) whose jobs are IT/Software QA roles.
+    Fails open — returns all indices — on any API or parse error, so real jobs
+    are never silently dropped.
     """
-    prompt = GEMINI_PROMPT_TEMPLATE.format(
-        title=job.title,
-        company=job.company,
-        location=job.location,
-        description=job.description[:1500],  # stay well within token limits
+    job_data = [
+        {
+            "id": i,
+            "title": job.title,
+            "company": job.company,
+            "description": job.description[:400],
+        }
+        for i, job in enumerate(jobs)
+    ]
+    prompt = GEMINI_BATCH_PROMPT.format(
+        jobs_json=json.dumps(job_data, ensure_ascii=False, indent=2)
     )
-    result = True  # fail-open default
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                max_output_tokens=5,
+                max_output_tokens=200,
                 temperature=0.0,
             ),
         )
-        verdict = response.text.strip().upper().rstrip(".").strip()
+        raw = response.text.strip()
+        # Accept either a bare array or one wrapped in markdown fences
+        match = re.search(r"\[[\d\s,]*\]", raw, re.DOTALL)
+        if not match:
+            logger.warning("Gemini batch: unexpected response %r — passing all through.", raw[:200])
+            return set(range(len(jobs)))
+        ids: list[int] = json.loads(match.group())
+        valid_ids = {i for i in ids if isinstance(i, int) and 0 <= i < len(jobs)}
         logger.info(
-            "Gemini %-55s → %s",
-            f"'{job.title[:50]}'",
-            verdict,
+            "Gemini batch (%d jobs) → %d matched: IDs %s",
+            len(jobs), len(valid_ids), sorted(valid_ids),
         )
-        result = verdict.startswith("YES")
+        return valid_ids
     except Exception as exc:  # noqa: BLE001
-        logger.error("Gemini API error for '%s': %s — passing through.", job.title, exc)
-        result = True  # fail open
-    finally:
-        # Enforce free-tier limit: max 15 requests/min → sleep 4.5 s after every call
-        time.sleep(GEMINI_RATE_LIMIT_SLEEP)
-    return result
+        logger.error("Gemini batch API error: %s — passing all %d jobs through.", exc, len(jobs))
+        return set(range(len(jobs)))  # fail open
 
 
 # ---------------------------------------------------------------------------
@@ -553,10 +541,19 @@ def send_telegram_alert(job: Job, token: str, chat_id: str) -> bool:
         resp = requests.post(api_url, json=payload, timeout=15)
         resp.raise_for_status()
         return True
+    except requests.HTTPError as exc:
+        # e.g. 400 Bad Request (wrong chat_id, bot not started by user, etc.)
+        body = exc.response.text if exc.response is not None else "N/A"
+        logger.error(
+            "Telegram HTTP error for '%s': %s — API response: %s",
+            job.title, exc, body,
+        )
+        return False
     except requests.RequestException as exc:
-        logger.error("Telegram send failed for '%s': %s", job.title, exc)
-        if hasattr(exc, "response") and exc.response is not None:
-            logger.error("Telegram API response body: %s", exc.response.text)
+        logger.error("Telegram request failed for '%s': %s", job.title, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Unexpected Telegram error for '%s': %s", job.title, exc)
         return False
 
 
@@ -580,44 +577,69 @@ def main() -> None:
     # ── Scrape all sources ───────────────────────────────────────────────────
     all_jobs: list[Job] = []
     all_jobs.extend(scrape_karriere_at())
-    all_jobs.extend(scrape_devjobs_at())
-    logger.info("Total jobs scraped across all sources: %d", len(all_jobs))
+    # devjobs.at disabled — aggressive anti-scraping returns 429.
+    # Uncomment the line below to re-enable once a workaround is in place:
+    # all_jobs.extend(scrape_devjobs_at())
+    logger.info("Total jobs scraped: %d", len(all_jobs))
 
-    # ── Process each job ─────────────────────────────────────────────────────
+    # ── Deduplication pass (done BEFORE calling Gemini to save quota) ────────
     updated_hashes: set[str] = set(seen_hashes)
     sent = skipped_dup = skipped_filter = 0
+    new_jobs: list[Job] = []
 
     for job in all_jobs:
-        t_hash = job.text_fingerprint()
-        u_hash = job.url_fingerprint()
-
-        # 1. Deduplication — check both text and URL fingerprints
-        if t_hash in seen_hashes or u_hash in seen_hashes:
-            logger.debug("Duplicate — skip: %s", job.title)
+        if job.text_fingerprint() in seen_hashes or job.url_fingerprint() in seen_hashes:
             skipped_dup += 1
             continue
+        new_jobs.append(job)
 
-        # 2. AI relevance filter
-        if not is_it_qa_role(job, gemini_client):
-            logger.info("Non-IT QA — filtered: %s", job.title)
-            # Mark as seen so we don't waste Gemini quota re-checking it
+    logger.info(
+        "New (unseen) jobs to classify: %d | Duplicates skipped: %d",
+        len(new_jobs), skipped_dup,
+    )
+
+    # ── Gemini batch filtering ────────────────────────────────────────────────
+    # Split new_jobs into batches of GEMINI_BATCH_SIZE and send one API call
+    # per batch instead of one call per job — dramatically reduces RPM usage.
+    approved_jobs: list[Job] = []
+    total_batches = -(-len(new_jobs) // GEMINI_BATCH_SIZE) if new_jobs else 0  # ceiling div
+
+    for batch_num, batch_start in enumerate(range(0, len(new_jobs), GEMINI_BATCH_SIZE), 1):
+        batch = new_jobs[batch_start : batch_start + GEMINI_BATCH_SIZE]
+        logger.info("Gemini: batch %d/%d — classifying %d jobs", batch_num, total_batches, len(batch))
+
+        matched_indices = filter_jobs_batch(batch, gemini_client)
+
+        for i, job in enumerate(batch):
+            t_hash = job.text_fingerprint()
+            u_hash = job.url_fingerprint()
+            # Mark every job seen so we never re-classify it
             updated_hashes.add(t_hash)
             updated_hashes.add(u_hash)
-            skipped_filter += 1
-            continue
+            if i in matched_indices:
+                approved_jobs.append(job)
+            else:
+                skipped_filter += 1
+                logger.info("Non-IT QA — filtered: %s", job.title)
 
-        # 3. Send Telegram notification
+        # Sleep between batches (not after the last one)
+        if batch_start + GEMINI_BATCH_SIZE < len(new_jobs):
+            logger.debug("Sleeping %ss before next Gemini batch...", GEMINI_BATCH_DELAY)
+            time.sleep(GEMINI_BATCH_DELAY)
+
+    logger.info(
+        "Gemini done — approved: %d | filtered (non-QA): %d",
+        len(approved_jobs), skipped_filter,
+    )
+
+    # ── Send Telegram alerts ──────────────────────────────────────────────────
+    for job in approved_jobs:
         success = send_telegram_alert(job, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         if success:
             logger.info("✓ Sent: %s @ %s", job.title, job.company)
             sent += 1
         else:
             logger.warning("✗ Failed to send: %s", job.title)
-
-        # Mark as seen regardless of send success to avoid re-sending on retry
-        updated_hashes.add(t_hash)
-        updated_hashes.add(u_hash)
-
         time.sleep(TELEGRAM_DELAY_SEC)  # stay under Telegram rate limit
 
     # ── Persist updated database ─────────────────────────────────────────────
