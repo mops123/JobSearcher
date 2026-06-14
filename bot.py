@@ -57,10 +57,9 @@ GEMINI_MODEL = "gemini-2.5-flash"
 SCRAPE_DELAY_SEC = 2
 TELEGRAM_DELAY_SEC = 1
 REQUEST_TIMEOUT_SEC = 30
-# Batch processing: group new jobs before calling Gemini.
-# Free tier = 15 RPM; one batch call per ~15 jobs is far cheaper than per-job.
-GEMINI_BATCH_SIZE = 10        # jobs per Gemini call (smaller = safer for free tier)
-GEMINI_BATCH_DELAY = 12       # seconds between batches (~5 batches/min < 15 RPM limit)
+# Gemini: single call for all new jobs.
+# If a 429 is hit, retry once after a longer wait.
+GEMINI_RETRY_WAIT = 45        # seconds to wait after a 429 before the single retry
 
 HEADERS = {
     "User-Agent": (
@@ -498,14 +497,21 @@ def _extract_json_array(text: str) -> list[int]:
     return []
 
 
-def filter_jobs_batch(jobs: list[Job], client: genai.Client) -> set[int]:
+def classify_all_jobs(jobs: list[Job], client: genai.Client) -> set[int]:
     """
-    Send a batch of jobs to Gemini in one call.
+    Send ALL unseen jobs to Gemini in a single API call.
     Returns the set of 0-based indices whose jobs are IT/Software QA roles.
 
-    FAIL-CLOSED: on any API error (including 429) or parse failure, returns an
-    empty set so no unvetted jobs are forwarded to Telegram.
+    Retry logic:
+      - Up to 2 attempts total.
+      - On a 429 / RESOURCE_EXHAUSTED error, sleeps GEMINI_RETRY_WAIT seconds
+        then retries once.
+      - On any other failure, or if both attempts fail, returns an empty set
+        (fail-closed: no unvetted jobs reach Telegram).
     """
+    if not jobs:
+        return set()
+
     job_data = [
         {
             "id": i,
@@ -518,46 +524,61 @@ def filter_jobs_batch(jobs: list[Job], client: genai.Client) -> set[int]:
     prompt = GEMINI_BATCH_PROMPT.format(
         jobs_json=json.dumps(job_data, ensure_ascii=False, indent=2)
     )
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=200,
-                temperature=0.0,
-                # Disable automatic function calling so the SDK executes a single
-                # sequential HTTP request and honours our inter-batch sleep.
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True,
-                ),
-            ),
-        )
-        raw = response.text.strip()
-        logger.debug("Gemini raw response: %r", raw[:300])
 
-        ids = _extract_json_array(raw)
-        if not ids and raw not in ("", "[]"):
-            # An empty result on a non-empty, non-empty-array response is
-            # suspicious — log it so we can debug future edge cases.
-            logger.warning(
-                "Gemini batch: no IDs extracted from response %r — dropping batch.",
-                raw[:200],
+    for attempt in range(1, 3):          # attempt 1, then attempt 2
+        try:
+            logger.info(
+                "Gemini: classifying %d jobs in a single call (attempt %d/2)",
+                len(jobs), attempt,
             )
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=500,
+                    temperature=0.0,
+                    # Disable AFC so the SDK makes exactly one sequential HTTP
+                    # request and our retry sleep is always respected.
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True,
+                    ),
+                ),
+            )
+            raw = response.text.strip()
+            logger.debug("Gemini raw response: %r", raw[:400])
 
-        valid_ids = {i for i in ids if isinstance(i, int) and 0 <= i < len(jobs)}
-        logger.info(
-            "Gemini batch (%d jobs) → %d matched: IDs %s",
-            len(jobs), len(valid_ids), sorted(valid_ids),
-        )
-        return valid_ids
+            ids = _extract_json_array(raw)
+            if not ids and raw not in ("", "[]"):
+                logger.warning(
+                    "Gemini: no IDs extracted from response %r — 0 jobs approved.",
+                    raw[:200],
+                )
 
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "Gemini batch error: %s — dropping batch (0 approved). "
-            "Will sleep %ss before next batch.",
-            exc, GEMINI_BATCH_DELAY,
-        )
-        return set()  # fail closed — never spam Telegram with unvetted jobs
+            valid_ids = {i for i in ids if isinstance(i, int) and 0 <= i < len(jobs)}
+            logger.info(
+                "Gemini: %d/%d jobs matched — IDs %s",
+                len(valid_ids), len(jobs), sorted(valid_ids),
+            )
+            return valid_ids
+
+        except Exception as exc:  # noqa: BLE001
+            exc_str = str(exc)
+            is_429 = "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str.upper()
+            if is_429 and attempt == 1:
+                logger.warning(
+                    "Hit 429 rate limit. Waiting %s seconds before retrying single block...",
+                    GEMINI_RETRY_WAIT,
+                )
+                time.sleep(GEMINI_RETRY_WAIT)
+                continue   # go to attempt 2
+            # Non-429 error, or second attempt also failed
+            logger.error(
+                "Gemini call failed (attempt %d/2): %s — 0 jobs approved.",
+                attempt, exc,
+            )
+            return set()  # fail closed
+
+    return set()  # should not be reached
 
 
 # ---------------------------------------------------------------------------
@@ -653,35 +674,21 @@ def main() -> None:
         len(new_jobs), skipped_dup,
     )
 
-    # ── Gemini batch filtering ────────────────────────────────────────────────
-    # Split new_jobs into batches of GEMINI_BATCH_SIZE and send one API call
-    # per batch instead of one call per job — dramatically reduces RPM usage.
+    # ── Single Gemini call for all new jobs ──────────────────────────────────
     approved_jobs: list[Job] = []
-    total_batches = -(-len(new_jobs) // GEMINI_BATCH_SIZE) if new_jobs else 0  # ceiling div
+    skipped_filter = 0
 
-    for batch_num, batch_start in enumerate(range(0, len(new_jobs), GEMINI_BATCH_SIZE), 1):
-        batch = new_jobs[batch_start : batch_start + GEMINI_BATCH_SIZE]
-        logger.info("Gemini: batch %d/%d — classifying %d jobs", batch_num, total_batches, len(batch))
+    matched_indices = classify_all_jobs(new_jobs, gemini_client)
 
-        matched_indices = filter_jobs_batch(batch, gemini_client)
-
-        for i, job in enumerate(batch):
-            t_hash = job.text_fingerprint()
-            u_hash = job.url_fingerprint()
-            # Mark every job seen so we never re-classify it
-            updated_hashes.add(t_hash)
-            updated_hashes.add(u_hash)
-            if i in matched_indices:
-                approved_jobs.append(job)
-            else:
-                skipped_filter += 1
-                logger.info("Non-IT QA — filtered: %s", job.title)
-
-        # Always sleep between batches — even after an error/429 — so the next
-        # batch doesn't immediately hit the same rate-limit wall.
-        if batch_start + GEMINI_BATCH_SIZE < len(new_jobs):
-            logger.info("Sleeping %ss before next Gemini batch...", GEMINI_BATCH_DELAY)
-            time.sleep(GEMINI_BATCH_DELAY)
+    for i, job in enumerate(new_jobs):
+        # Mark every job seen regardless of outcome so we don't re-classify it
+        updated_hashes.add(job.text_fingerprint())
+        updated_hashes.add(job.url_fingerprint())
+        if i in matched_indices:
+            approved_jobs.append(job)
+        else:
+            skipped_filter += 1
+            logger.info("Non-IT QA — filtered: %s", job.title)
 
     logger.info(
         "Gemini done — approved: %d | filtered (non-QA): %d",
