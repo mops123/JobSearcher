@@ -1,0 +1,66 @@
+name: IT QA Job Scraper & Notifier
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    # Hourly from 06:00–16:00 UTC = 08:00–18:00 Vienna time (UTC+2 summer).
+    # Stays well within GitHub Actions' free-tier 2 000 min/month limit.
+    - cron: "0 6-16 * * *"
+  workflow_dispatch:          # Allow manual runs from the Actions tab
+
+# ── Permissions ───────────────────────────────────────────────────────────────
+# "contents: write" is required so the workflow can push jobs_db.json back.
+permissions:
+  contents: write
+
+# ── Job ───────────────────────────────────────────────────────────────────────
+jobs:
+  scrape:
+    name: Scrape & Notify
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the repo (including jobs_db.json if it already exists)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Use the default GITHUB_TOKEN; "contents: write" above grants push.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Set up Python 3.11
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Cache pip wheels — speeds up subsequent runs
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # 4. Install Python dependencies
+      - name: Install dependencies
+        run: pip install --upgrade pip && pip install -r requirements.txt
+
+      # 5. Run the scraper
+      #    Secrets are injected as environment variables — never stored in code.
+      - name: Run job scraper
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
+
+      # 6. Commit jobs_db.json back so deduplication persists across runs.
+      #    "[skip ci]" in the commit message prevents triggering another run.
+      - name: Persist job database
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add jobs_db.json
+          git diff --staged --quiet \
+            || (git commit -m "chore: update jobs_db [skip ci]" && git push)
